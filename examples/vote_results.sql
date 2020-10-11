@@ -1,20 +1,47 @@
-/**********************************************
-* This is an example of how to get vote results out of an instance of cardano-db-sync
-* These queries were run against db-sync 5.0.1 to tally results of SPOCRA vote 1
+/*****************************************************************************************************************************
 * 
-* Run these queries one by one to build up the intermediate tables and final table of results.
+* This is an example of how to get vote results out of an instance of cardano-db-sync
+* These queries were run against db-sync 5.0.1 to tally results of SPOCRA votes 1 and 2
+* 
+* This is  a second independant vote-counting implementation developed for the SPOCRA vote to validate
+*  results from the SPOCRA voting application
+* 
+* In order to run this script yourself, run this script in it's entirety on a cardano-db-sync postgres database. 
+*  this will build the new SPOCRA schema and multiple views which will calculate view results
 * 
 * Prerequsities:
-* 	A schema schema called 'spocra' within the same database as your dbsync database
-* 	a table of registerd voter ids
+* 	In order to accurately validate candidates, you will need to insert the valid voter ids into the registered_voters table 
+* 		this list will not be public until after the voting has completed.
 *
-***********************************************/
+******************************************************************************************************************************/
 
+
+----------------------------------------------
+-- Create necessary objects
+----------------------------------------------
+CREATE SCHEMA IF NOT EXISTS spocra
+    AUTHORIZATION postgres;
+
+CREATE TABLE IF NOT EXISTS spocra.registered_voters
+(
+    voter_id character varying COLLATE pg_catalog."default" NOT NULL,
+	username character varying COLLATE pg_catalog."default" NULL,
+    proposal_id character varying COLLATE pg_catalog."default" NOT NULL,
+    CONSTRAINT registered_voters_pkey PRIMARY KEY (voter_id, proposal_id)
+)
+WITH (
+    OIDS = FALSE
+)
+TABLESPACE pg_default;
+
+ALTER TABLE spocra.registered_voters
+    OWNER to postgres;
 
 ---------------------------------------------
 -- proposal - Vote 1 Proposal
 ---------------------------------------------
-
+	create or replace view spocra.v_proposals
+	as 
 	select 
 		tm.json ->> 'Title' as title,
 		tm.json ->> 'Question' as question,
@@ -28,29 +55,26 @@
 		tm.json ->> 'ProposalUrl' as proposal_url,
 		tm.json ->> 'VoteStartPeriod' as vote_start_period,
 		tm.json ->> 'VoteEndPeriod' as vote_end_period
-	into spocra.vote1_proposal
 	from tx_metadata tm
 	where tm.json->> 'ObjectType' = 'VoteProposal'
-		-----------------------------------------
-		-- EDIT THESE PARAMETERS TO CHANGE VOTE --
-		and tm.json ->> 'NetworkId' = 'SPOCRA'
-		and tm.json ->> 'ProposalId' = '00d8f63b-9efb-41b6-90dc-35d90f5ad4e2';
-		-- END EDIT --
+		and tm.json ->> 'NetworkId' = 'SPOCRA';
 
 ---------------------------------------------
 -- candidates - List of Candidates
 ---------------------------------------------
 
+	create or replace view spocra.v_candidates
+	as
 	select 
 		opt."CandidateId" as candidate_id,
 		opt."Name" as name,
 		opt."Description" as description,
-		opt."URL" as url	
-	into spocra.vote1_candidates
+		opt."URL" as url,
+		v.proposal_id
 	from tx_metadata tm,
 		jsonb_to_recordset(cast( tm.json ->> 'VoteOptions' as jsonb))
 			as opt("CandidateId"  varchar, "URL" varchar, "Name" varchar, "Description" varchar),
-		spocra.vote1_proposal v 
+		spocra.v_proposals v 
 	where tm.json->> 'ObjectType' = 'VoteProposal'
 		and tm.json ->> 'NetworkId' = v.network_id
 		and tm.json ->> 'ProposalId' = v.proposal_id;
@@ -58,7 +82,8 @@
 ------------------------------------------------------
 -- ballot_raw - Ballot entries - not parsed yet
 ------------------------------------------------------
-
+	create or replace view spocra.v_ballot_raw
+	as
 	select 
 		tm.tx_id,
 		tm.json ->> 'ProposalId' as proposal_id,
@@ -71,34 +96,34 @@
 		t.fee,
 		t.out_sum,
 		t.size,
-		tm.json ->> 'Choices' as choices
-	into spocra.vote1_ballot_raw
+		tm.json ->> 'Choices' as choices,
+		tm.key
 	from tx_metadata tm
 		inner join tx t on t.id = tm.tx_id
 		inner join block b on t.block = b.block_no
-		cross join spocra.vote1_proposal p
-	where tm.json->> 'ObjectType' = 'VoteBallot'
-	and tm.json ->> 'ProposalId' = p.proposal_id;
+	where tm.json->> 'ObjectType' = 'VoteBallot';
+
 
 ------------------------------------------------------------------------------
--- vote1_ballot_entry_base - Individual ballot entries - multiple per vote cast
+-- v_ballot_entry_base - Individual ballot entries - multiple per vote cast
 ------------------------------------------------------------------------------
 
     -- there appears to be 2 formats of ballot, hence we need to union 2 queries
     -- first, there is the array of choices
 	-- next we have the 'object' of choices with an arbitrary numeric key
+	create or replace view spocra.v_ballot_entry_base
+	as
 	select *
-	into spocra.vote1_ballot_entry_base
 	from (
 		select b.*,
 			row_number() over (partition by tx_id) choice_index,
 			c."CandidateId" as candidate_id,
 			c."VoteRank"  as vote_rank,
 			c."VoteWeight"  as vote_weight 
-		from spocra.vote1_ballot_raw b,
+		from spocra.v_ballot_raw b,
 			jsonb_to_recordset(cast(b.choices as jsonb)) as c("CandidateId" varchar, "VoteRank" int, "VoteWeight" int )
 		where jsonb_typeof(cast(b.choices as jsonb)) = 'array'
-			-- this is 2 bad ballots, we can probably fix - should investigate
+			-- this was 2 bad ballots - breaks parsing rules
 			and b.choices not like '[[%'
 
 		union all
@@ -108,7 +133,7 @@
 			c.value ->> 'CandidateId' as candidate_id,
 			cast(c.value ->> 'VoteRank' as int) as vote_rank,
 			cast(c.value ->> 'VoteWeight' as int) as vote_weight 
-		from spocra.vote1_ballot_raw b,
+		from spocra.v_ballot_raw b,
 			jsonb_each(cast(b.choices as jsonb)) c
 		where jsonb_typeof(cast(b.choices as jsonb)) = 'object'
 
@@ -116,7 +141,7 @@
 
 
 ------------------------------------------------------------------------------
--- vote1_ballot_entry - Individual ballot entries with some additional validation flags added
+-- v_ballot_entry - Individual ballot entries with some additional validation flags added
 ------------------------------------------------------------------------------
 /* 
 	1. Check if the vote was received within the valid voting window 
@@ -126,7 +151,8 @@
 	5. Check if the ballot contains more than the maximum number of votes, discard if votes cast exceeds the VoteLimit of the proposal
 */
 
-	--drop table spocra.vote1_ballot_entry
+	create or replace view spocra.v_ballot_entry
+	as
 	select 
 		b.*,
 		-- vote score - this adds the weightings
@@ -140,32 +166,34 @@
 			when b.epoch_no >= cast(p.vote_start_period as int) AND b.epoch_no <= cast(p.vote_end_period as int)
 				THEN 1 else 0
 			end as is_within_epochs, -- is this in epoch 218 or 219?
-		case when sum(vote_weight) over (partition by tx_id) <= cast(p.vote_limit as int) then 1 else 0 end as is_within_limit, -- have they cast more than 3 votes
+		case when sum(vote_weight) over (partition by tx_id, key) <= cast(p.vote_limit as int) then 1 else 0 end as is_within_limit, -- have they cast more than 3 votes
 		case when cast(b.vote_weight as int) > 1 then 0 else 1 end as is_vote_weight_valid, -- have they given an entry a weight of more than 1?
 		case when rv.voter_id is null then 0 else 1 end as is_registered_voter -- is this person in our list of registered voters?
-	into spocra.vote1_ballot_entry
-	from spocra.vote1_ballot_entry_base b
-		cross join spocra.vote1_proposal p
-		left join spocra.registered_voters rv on replace(lower(ltrim(rtrim(b.voter_id))), '-', '') = rv.voter_id;
+	--into spocra.v_ballot_entry
+	from spocra.v_ballot_entry_base b
+		left join spocra.v_proposals p on p.proposal_id = b.proposal_id
+		left join spocra.registered_voters rv on replace(lower(ltrim(rtrim(b.voter_id))), '-', '') = rv.voter_id
+			and rv.proposal_id = b.proposal_id;
 	
 
 
 ---------------------------------------------------------------------------------------------------------------
--- vote1_vote_validation - This rolls up the vote and determines validity based on flags in the ballot entries
+-- v_vote_validation - This rolls up the vote to the ballot level and determines validity based on flags in the ballot entries
 -- 	this also adds a vote_num which indicates which vote this is for an individual voter_id 
 -- 		only the first vote (vote_num = 1) is counted
 ----------------------------------------------------------------------------------------------------------------
-	--drop table spocra.vote1_vote_validation
+	create or replace view spocra.v_vote_validation
+	as
 	select 
 		*,
-		row_number() over (partition by voter_id order by is_ballot_valid desc, slot_no) as vote_num
-	into spocra.vote1_vote_validation
+		row_number() over (partition by proposal_id, voter_id order by is_ballot_valid desc, slot_no) as vote_num
 	from (
 		select 
 			tx_id,
 			voter_id,
 			slot_no,
 			hash,
+			proposal_id,
 			case 
 				when 
 					min(is_within_epochs) > 0 and  -- 
@@ -176,24 +204,31 @@
 				then 1
 				else 0
 			end as is_ballot_valid -- this ballot follows all the rules (still might be discarded if it's not the first valid vote)		
-		from spocra.vote1_ballot_entry a
+		from spocra.v_ballot_entry a
 		group by 
 			tx_id,
 			voter_id,
 			slot_no,
-			hash
+			hash,
+			proposal_id
 	) a;
 
 
 ----------------------------------------------------------------------------------------
 -- FINAL vote table - append all flags, validation and scores 
 -- 	- make final decision if this should be counted based on order of valid votes
+-- - the granularity of this table is the individual candidate vote - multiple records per ballot
 -----------------------------------------------------------------------------------------
 
-	-- drop table spocra.vote1_vote
+	create or replace view spocra.v_vote
+	as
 	select 
 		b.tx_id,
 		b.proposal_id,
+		case when b.proposal_id = '00d8f63b-9efb-41b6-90dc-35d90f5ad4e2' then 'vote 1' 
+			when b.proposal_id = '9cdb445e-b2ce-4922-8272-4b8549b823d2' then 'vote 2'
+			else 'other'
+			end as vote_name,
 		b.hash,
 		b.voter_id,
 		b.block_no,
@@ -203,8 +238,8 @@
 		b.fee,
 		b.out_sum,
 		b.size,
-		
-		-- validation
+
+		-- validation flags
 		b.is_within_epochs,
 		b.is_within_limit,
 		b.is_vote_weight_valid,
@@ -223,19 +258,14 @@
 		c.name as candidate_name,
 		c.description as candidate_description,
 		c.url as candidate_url,
-		current_date as data_as_of
+		current_timestamp as data_as_of
 		
-	into spocra.vote1_vote
-	from spocra.vote1_vote_validation vvr
-		inner join spocra.vote1_ballot_entry b on vvr.tx_id = b.tx_id
-		left join  spocra.vote1_candidates c on b.candidate_id = c.candidate_id;
+	from spocra.v_vote_validation vvr
+		left join spocra.v_ballot_entry b on vvr.tx_id = b.tx_id
+		left join  spocra.v_candidates c on b.candidate_id = c.candidate_id;
 
 
 -- now bask in the magic!
 select *
-from spocra.vote1_vote
+from spocra.v_vote
 
-
-
-
-		
