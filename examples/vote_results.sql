@@ -100,7 +100,7 @@ ALTER TABLE spocra.registered_voters
 		tm.key
 	from tx_metadata tm
 		inner join tx t on t.id = tm.tx_id
-		inner join block b on t.block = b.block_no
+		inner join block b on t.block = b.id
 	where tm.json->> 'ObjectType' = 'VoteBallot';
 
 
@@ -261,7 +261,7 @@ ALTER TABLE spocra.registered_voters
 		current_timestamp as data_as_of
 		
 	from spocra.v_vote_validation vvr
-		left join spocra.v_ballot_entry b on vvr.tx_id = b.tx_id
+		left join spocra.v_ballot_entry b on vvr.tx_id = b.tx_id and b.voter_id = vvr.voter_id
 		left join  spocra.v_candidates c on b.candidate_id = c.candidate_id;
 
 
@@ -269,3 +269,30 @@ ALTER TABLE spocra.registered_voters
 select *
 from spocra.v_vote
 
+
+-----------------------------
+-- Final Results:
+-----------------------------
+select 	
+	candidate_id, 
+	candidate_name, 
+	count(*) as total_votes,
+	count(case when vote_rank = 1 then 1 else null end) as rank1_votes,
+	count(case when vote_rank = 2 then 1 else null end) as rank2_votes,
+	count(case when vote_rank = 3 then 1 else null end) as rank3_votes,
+	sum(vote_score) as total_score
+from spocra.v_vote
+where is_vote_counted = 1
+	and vote_name = 'vote 2'
+group by candidate_id, 
+	candidate_name
+order by total_score desc;
+
+
+-----------------------------------
+-- Count of voters
+----------------------------------
+select distinct voter_id
+from spocra.v_vote
+where is_vote_counted = 1
+	and vote_name = 'vote 2'
