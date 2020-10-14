@@ -25,7 +25,6 @@ CREATE SCHEMA IF NOT EXISTS spocra
 CREATE TABLE IF NOT EXISTS spocra.registered_voters
 (
     voter_id character varying COLLATE pg_catalog."default" NOT NULL,
-	username character varying COLLATE pg_catalog."default" NULL,
     proposal_id character varying COLLATE pg_catalog."default" NOT NULL,
     CONSTRAINT registered_voters_pkey PRIMARY KEY (voter_id, proposal_id)
 )
@@ -37,8 +36,21 @@ TABLESPACE pg_default;
 ALTER TABLE spocra.registered_voters
     OWNER to postgres;
 
+-----------------------------------------------------
+-- Populate registered voters from on chain record
+-- will populate for all proposals
+-----------------------------------------------------
+
+insert into spocra.registered_voters
+select 
+	tm.json ->> 'ProposalId' as proposal_id,
+	jsonb_array_elements_text(cast(tm.json ->> 'Voters' as jsonb))  as arr
+from tx_metadata tm		
+where tm.json->> 'ObjectType' = 'VoteRegistration'
+	and tm.json ->> 'NetworkId' = 'SPOCRA';
+
 ---------------------------------------------
--- proposal - Vote 1 Proposal
+-- proposal - main proposals view
 ---------------------------------------------
 	create or replace view spocra.v_proposals
 	as 
@@ -172,7 +184,7 @@ ALTER TABLE spocra.registered_voters
 	--into spocra.v_ballot_entry
 	from spocra.v_ballot_entry_base b
 		left join spocra.v_proposals p on p.proposal_id = b.proposal_id
-		left join spocra.registered_voters rv on replace(lower(ltrim(rtrim(b.voter_id))), '-', '') = rv.voter_id
+		left join spocra.registered_voters rv on replace(lower(ltrim(rtrim(b.voter_id))), '-', '') =  replace(lower(ltrim(rtrim(rv.voter_id))), '-', '')
 			and rv.proposal_id = b.proposal_id;
 	
 
